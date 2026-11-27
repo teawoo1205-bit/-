@@ -6,8 +6,8 @@ import secrets
 from pathlib import Path
 from aiohttp import WSMsgType, web
 
-GAME = Path(__file__).with_name("ashen_keep_v77.html")
-HEROES = ("RED", "ORANGE", "YELLOW", "GREEN", "BLUE", "PURPLE", "WHITE")
+GAME = Path(__file__).with_name("ashen_keep_v79.html")
+HEROES = ("RED", "ORANGE", "YELLOW", "GREEN", "BLUE", "PURPLE", "WHITE", "SAINT")
 TROPHIES = {"boar", "troll", "ent", "lich", "commander", "sentinel", "wyrm"}
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 rooms = {}
@@ -16,7 +16,15 @@ UPGRADES = set("speed orangeOrbSpeed area projectileSpeed chainLength orangeFire
 def levels(raw):
     if not isinstance(raw,dict):
         return {}
-    return {k:int(v) for k,v in raw.items() if k in UPGRADES and type(v) in (int,float) and math.isfinite(v) and 0<=v<=100}
+    clean = {k:int(v) for k,v in raw.items() if k in UPGRADES and type(v) in (int,float) and math.isfinite(v) and 0<=v<=100}
+    remaining = 6
+    for key in ("runePower", "runeVital", "runeHaste"):
+        v = raw.get(key, 0)
+        if type(v) is int and 0 <= v <= remaining:
+            clean[key] = v
+            remaining -= v
+    clean["summerSkin"] = int(raw.get("summerSkin") == 1)
+    return clean
 
 
 
@@ -44,10 +52,31 @@ async def lobby(room):
     await broadcast(room, {"t": "lobby", "code": room["code"], "mode": room["mode"], "members": roster(room)})
 
 
+async def frame_sender(peer):
+    # A slow reader holds at most one baseline and its newest independent delta.
+    try:
+        while True:
+            await peer["wake"].wait()
+            peer["wake"].clear()
+            for key in ("keyframe", "delta"):
+                if len(peer["inflight"]) >= 3:
+                    break
+                packet = peer.pop(key, None)
+                if packet:
+                    number, text = packet
+                    peer["inflight"].append(number)
+                    await peer["ws"].send_str(text)
+                # A newer baseline that arrived while sending must precede its delta.
+                if key == "keyframe" and "keyframe" in peer:
+                    break
+    except (ConnectionError, RuntimeError):
+        return
+
+
 async def socket(request):
     ws = web.WebSocketResponse(heartbeat=22, max_msg_size=1024*1024, compress=True)
     await ws.prepare(request)
-    room, mine = None, None
+    room, mine, sender = None, None, None
     try:
         async for message in ws:
             if message.type != WSMsgType.TEXT:
@@ -60,6 +89,9 @@ async def socket(request):
                 break
             kind = data.get("t")
             if room is None:
+                if data.get("wire") != 5:
+                    await tell(ws, {"t":"error","message":"게임과 서버를 모두 최신 협동 파일로 업데이트해 줘."})
+                    break
                 if kind == "create" and data.get("mode") in ("normal", "raid") and len(rooms) < 500:
                     code = "".join(secrets.choice(ALPHABET) for _ in range(6))
                     while code in rooms:
@@ -77,7 +109,12 @@ async def socket(request):
                     await tell(ws, {"t": "error", "message": "방을 열 수 없어. 잠시 뒤 다시 시도해 줘."})
                     break
                 room["members"][mine] = {"ws": ws, "hero": None}
-                await tell(ws, {"t": "seat", "id": mine})
+                if mine != 1:
+                    box = room["members"][mine]
+                    box["wake"] = asyncio.Event()
+                    box["inflight"] = []
+                    sender = asyncio.create_task(frame_sender(box))
+                await tell(ws, {"t": "seat", "id": mine, "wire":5})
                 await lobby(room)
             elif not room["started"]:
                 if kind == "pick":
@@ -95,8 +132,38 @@ async def socket(request):
                         room["started"] = True
                         room["heroes"] = {p["id"]:p["hero"] for p in roster(room)}
                         await broadcast(room, {"t": "begin", "mode": room["mode"], "members": [{**p,"up":room["members"][p["id"]].get("up",{})} for p in roster(room)]})
-            elif mine == 1 and kind == "frame" and isinstance(data.get("world"), dict):
-                await asyncio.gather(*(p["ws"].send_str(message.data) for i,p in list(room["members"].items()) if i != 1 and not p["ws"].closed),return_exceptions=True)
+            elif kind == "signal" and not room["done"]:
+                dest = data.get("to")
+                if type(dest) is not int or dest not in room["members"] or dest == mine or (mine != 1 and dest != 1):
+                    continue
+                sdp, ice = data.get("sdp"), data.get("ice")
+                if isinstance(sdp, dict) and sdp.get("type") == ("offer" if mine == 1 else "answer") and isinstance(sdp.get("sdp"), str) and len(sdp["sdp"]) <= 24000:
+                    await tell(room["members"][dest]["ws"], {"t":"signal","from":mine,"sdp":{"type":sdp["type"],"sdp":sdp["sdp"]}})
+                elif isinstance(ice, dict) and isinstance(ice.get("candidate"), str) and len(ice["candidate"]) <= 2048:
+                    await tell(room["members"][dest]["ws"], {"t":"signal","from":mine,"ice":{k:ice[k] for k in ("candidate","sdpMid","sdpMLineIndex","usernameFragment") if k in ice}})
+            elif mine == 1 and kind == "frame" and not room["done"]:
+                is_key = isinstance(data.get("world"), dict)
+                if not is_key and not isinstance(data.get("patch"), dict):
+                    continue
+                number = data.get("n")
+                if type(number) is not int or number <= 0:
+                    continue
+                destinations = data.get("to")
+                for seat, peer in room["members"].items():
+                    if seat == 1 or (not is_key and isinstance(destinations, list) and seat not in destinations):
+                        continue
+                    if is_key:
+                        peer["keyframe"] = (number, message.data)
+                        peer.pop("delta", None)
+                    else:
+                        peer["delta"] = (number, message.data)
+                    peer["wake"].set()
+            elif mine != 1 and kind == "seen":
+                peer = room["members"][mine]
+                number = data.get("n")
+                if type(number) is int and number in peer["inflight"]:
+                    peer["inflight"] = [n for n in peer["inflight"] if n > number]
+                    peer["wake"].set()
             elif mine != 1 and kind == "received" and room["done"]:
                 room["pending"].discard(mine)
                 if not room["pending"]:
@@ -104,7 +171,7 @@ async def socket(request):
             elif mine != 1 and kind == "input" and not room["done"]:
                 axes = [data.get(k) for k in ("x", "y")]
                 if all(type(n) in (float,int) and abs(n)<=1.001 and math.isfinite(n) for n in axes):
-                    await tell(room["members"][1]["ws"], {"t":"input","id":mine,"x":axes[0],"y":axes[1]})
+                    await tell(room["members"][1]["ws"], {"t":"input","id":mine,"n":bounded(data.get("n")),"x":axes[0],"y":axes[1]})
             elif mine != 1 and kind == "choice" and type(data.get("token")) is int and type(data.get("index")) is int and 0<=data["index"]<3:
                 await tell(room["members"][1]["ws"], {"t":"choice","id":mine,"token":data["token"],"index":data["index"]})
             elif mine == 1 and kind == "result" and not room["done"]:
@@ -114,7 +181,7 @@ async def socket(request):
                 await broadcast(room, {"t":"result","win":data.get("win") is True,
                                        "stats":battle_stats(data.get("stats"),room["heroes"]),
                                        "coins":bounded(data.get("coins")),"kills":bounded(data.get("kills")),
-                                       "trophies":[v for v in (data.get("trophies") or [])[:7] if isinstance(v,str) and v in TROPHIES]}, except_id=1)
+                                       "bossKills":[v for v in (data.get("bossKills") or [])[:7] if isinstance(v,str) and v in TROPHIES]}, except_id=1)
                 try:
                     await asyncio.wait_for(room["delivered"].wait(),timeout=4)
                 except asyncio.TimeoutError:
@@ -124,6 +191,9 @@ async def socket(request):
     except (ConnectionError, asyncio.CancelledError):
         pass
     finally:
+        if sender:
+            sender.cancel()
+            await asyncio.gather(sender,return_exceptions=True)
         if room and rooms.get(room["code"]) is room:
             room["members"].pop(mine,None)
             if room["done"] and "pending" in room:
@@ -166,7 +236,10 @@ def bounded(value):
 def app():
     application=web.Application()
     application.router.add_get("/",index)
+    application.router.add_get("/index.html",index)
     application.router.add_get("/ashen_keep_v77.html",index)
+    application.router.add_get("/ashen_keep_v78.html",index)
+    application.router.add_get("/ashen_keep_v79.html",index)
     application.router.add_get("/coop",socket)
     return application
 
