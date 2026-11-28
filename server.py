@@ -6,7 +6,7 @@ import secrets
 from pathlib import Path
 from aiohttp import WSMsgType, web
 
-GAME = Path(__file__).with_name("twilight_citadel.html")
+GAME = Path(__file__).with_name("index.html")
 HEROES = ("RED", "ORANGE", "YELLOW", "GREEN", "BLUE", "PURPLE", "WHITE", "SAINT")
 TROPHIES = {"boar", "troll", "ent", "lich", "commander", "sentinel", "wyrm"}
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -91,7 +91,7 @@ async def socket(request):
                 break
             kind = data.get("t")
             if room is None:
-                if data.get("wire") != 7:
+                if data.get("wire") != 10:
                     await tell(ws, {"t":"error","message":"게임과 서버를 모두 최신 협동 파일로 업데이트해 줘."})
                     break
                 if kind == "create" and data.get("mode") in ("normal", "raid") and len(rooms) < 500:
@@ -116,7 +116,7 @@ async def socket(request):
                     box["wake"] = asyncio.Event()
                     box["inflight"] = []
                     sender = asyncio.create_task(frame_sender(box))
-                await tell(ws, {"t": "seat", "id": mine, "wire":7})
+                await tell(ws, {"t": "seat", "id": mine, "wire":10})
                 await lobby(room)
             elif not room["started"]:
                 if kind == "pick":
