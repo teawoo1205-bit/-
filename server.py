@@ -6,7 +6,7 @@ import secrets
 from pathlib import Path
 from aiohttp import WSMsgType, web
 
-GAME = Path(__file__).with_name("ashen_keep_v79.html")
+GAME = Path(__file__).with_name("twilight_citadel.html")
 HEROES = ("RED", "ORANGE", "YELLOW", "GREEN", "BLUE", "PURPLE", "WHITE", "SAINT")
 TROPHIES = {"boar", "troll", "ent", "lich", "commander", "sentinel", "wyrm"}
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -24,6 +24,8 @@ def levels(raw):
             clean[key] = v
             remaining -= v
     clean["summerSkin"] = int(raw.get("summerSkin") == 1)
+    theme = raw.get("theme80", clean["summerSkin"])
+    clean["theme80"] = theme if type(theme) is int and 0 <= theme <= 4 else clean["summerSkin"]
     return clean
 
 
@@ -89,7 +91,7 @@ async def socket(request):
                 break
             kind = data.get("t")
             if room is None:
-                if data.get("wire") != 5:
+                if data.get("wire") != 7:
                     await tell(ws, {"t":"error","message":"게임과 서버를 모두 최신 협동 파일로 업데이트해 줘."})
                     break
                 if kind == "create" and data.get("mode") in ("normal", "raid") and len(rooms) < 500:
@@ -114,7 +116,7 @@ async def socket(request):
                     box["wake"] = asyncio.Event()
                     box["inflight"] = []
                     sender = asyncio.create_task(frame_sender(box))
-                await tell(ws, {"t": "seat", "id": mine, "wire":5})
+                await tell(ws, {"t": "seat", "id": mine, "wire":7})
                 await lobby(room)
             elif not room["started"]:
                 if kind == "pick":
@@ -240,6 +242,9 @@ def app():
     application.router.add_get("/ashen_keep_v77.html",index)
     application.router.add_get("/ashen_keep_v78.html",index)
     application.router.add_get("/ashen_keep_v79.html",index)
+    application.router.add_get("/ashen_keep_v80.html",index)
+    application.router.add_get("/ashen_keep_v80_fix1.html",index)
+    application.router.add_get("/twilight_citadel.html",index)
     application.router.add_get("/coop",socket)
     return application
 
